@@ -1,0 +1,1299 @@
+- name: 基础环境设置
+  hosts: all
+  remote_user: root
+
+  tasks:
+  - name: 基础环境设置---关闭firewalld
+    ansible.builtin.service:
+      name: firewalld
+      state: stopped
+      enabled: false
+
+  - name: 基础环境设置---关闭selinux
+    ansible.posix.selinux:
+      state: "disabled"
+    when:
+      - ansible_selinux.status == "enabled"
+
+  - name: 基础环境设置---关闭swap
+    ansible.builtin.shell: |
+      swapoff -a
+      sed -ri 's/.*swap.*/#&/' /etc/fstab
+    when:
+      - ansible_swaptotal_mb != "0"
+
+  - name: 基础环境设置---设置主机名
+    ansible.builtin.hostname:
+      name: "{{ hostvars[ansible_default_ipv4.address].vars.host_name }}"
+      use: systemd
+    when:
+      - ansible_os_family == "RedHat"
+
+  - name: 基础环境设置---设置/etc/hosts
+    ansible.builtin.template:
+      src: package/hosts.j2
+      dest: /etc/hosts
+
+  - name: 基础环境设置---设置sysctl.d/k8s.conf
+    ansible.builtin.copy:
+      src: package/k8s/k8s.conf
+      dest: /etc/sysctl.d/k8s.conf
+
+  - name: 基础环境设置---生效sysctl.d/k8s.conf
+    ansible.builtin.shell:  sysctl --system
+
+  - name: 基础环境设置---设置时区
+    ansible.builtin.copy:
+      remote_src: true
+      src: /usr/share/zoneinfo/Asia/Shanghai 
+      dest: /etc/localtime
+
+  - name: 基础环境设置---安装时间服务同步
+    ansible.builtin.yum:
+      name: ntpdate
+      state: installed
+
+  - name: 基础环境设置---进行时间同步
+    ansible.builtin.shell: ntpdate ntp.aliyun.com
+
+  - name: 基础环境设置---创建k8s目录
+    ansible.builtin.file:
+      path:  /opt/kubernetes/{{ item }}
+      state: directory
+      owner: root
+      group: root
+      recurse: yes
+    loop:
+      - bin
+      - cfg
+      - ssl
+      - logs
+
+  - name: 基础环境设置---拷贝k8s命令
+    ansible.builtin.copy:
+      src: package/kubernetes/server/bin/{{ item }}
+      dest: /opt/kubernetes/bin/
+      owner: root
+      group: root
+      mode: '0755'
+    loop:
+      - kube-apiserver
+      - kube-scheduler
+      - kube-controller-manager
+
+  - name: 基础环境设置---单独拷贝kubectl
+    ansible.builtin.copy:
+      src: package/kubernetes/server/bin/kubectl
+      dest: /usr/bin/
+      owner: root
+      group: root
+      mode: '0755'
+
+- name: 部署ETCD
+  hosts: all
+  remote_user: root
+
+  tasks:
+  - name: 部署ETCD---判断证书文件是否存在
+    ansible.builtin.stat:
+      path: /opt/etcd/ssl/ca-key.pem
+    register: file_status
+
+  - name: 部署ETCD---生成Etcd证书
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /usr/local/bin/{{ item.split('_')[-2].split('/')[-1] }}
+      owner: root
+      group: root
+      mode: '0775'
+    loop:
+      - package/cfssl-certinfo_linux-amd64
+      - package/cfssljson_linux-amd64
+      - package/cfssl_linux-amd64
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+  - name: 部署ETCD---创建存放证书的目录
+    ansible.builtin.file:
+      path: /root/TLS/{{ item }}
+      state: directory
+      owner: root
+      group: root
+      mode: 0775
+      recurse: yes
+    loop:
+      - etcd
+      - k8s
+
+  - name: 部署ETCD---拷贝证书ca.json文件
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /root/TLS/etcd/{{ item.split('/')[-1] }}
+      owner: root
+      group: root
+      mode: '0644'
+    loop:
+      - package/etcd/ca-config.json
+      - package/etcd/ca-csr.json
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+  - name: 部署ETCD---template server-csr.json
+    ansible.builtin.template:
+      src: package/etcd/server-csr.json.j2
+      dest: /root/TLS/etcd/server-csr.json
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+  - name: 部署ETCD---修改template server-csr.json
+    ansible.builtin.replace:
+      path: /root/TLS/etcd/server-csr.json
+      regexp: ',],'
+      replace: '],'
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+
+  - name: 部署ETCD---生成证书
+    ansible.builtin.shell: |
+      cd /root/TLS/etcd/ && cfssl gencert -initca ca-csr.json | cfssljson -bare ca - \
+      && cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=www server-csr.json | cfssljson -bare server
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+      - file_status.stat.exists == false
+
+  - name: 部署ETCD---获取证书到本地
+    ansible.builtin.fetch:
+      src: /root/TLS/etcd/{{ item }}
+      dest: package/etcd/
+      flat: yes
+    loop:
+      - ca-key.pem
+      - ca.pem
+      - server-key.pem
+      - server.pem
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+      - file_status.stat.exists == false
+
+  - name: 部署ETCD---创建ETCD工作目录并分发ETCD二进制包
+    ansible.builtin.file:
+      path: /opt/etcd/{{ item }}
+      state: directory
+      owner: root
+      group: root
+      mode: 0775
+      recurse: yes
+    loop:
+      - bin
+      - cfg
+      - ssl
+    when: hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+
+  - name: 部署ETCD---分发ETCD证书到其他节点
+    ansible.builtin.copy:
+      src: package/etcd/{{ item }}
+      dest: /opt/etcd/ssl/
+    loop:
+      - ca-key.pem
+      - ca.pem
+      - server-key.pem
+      - server.pem
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+      - file_status.stat.exists == false
+
+  - name: 部署ETCD---分发etcd命令
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /opt/etcd/bin/
+      owner: root
+      group: root
+      mode: '0775'
+    loop:
+      - package/etcd-v3.4.9-linux-amd64/etcd
+      - package/etcd-v3.4.9-linux-amd64/etcdctl
+    when: hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+
+  - name: 部署ETCD---template etcd.conf
+    ansible.builtin.template:
+      src: package/etcd/etcd.conf.j2
+      dest: /opt/etcd/cfg/etcd.conf
+    when: hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+
+  - name: 部署ETCD---修复template etcd.conf
+    ansible.builtin.replace:
+      path: /opt/etcd/cfg/etcd.conf
+      regexp: ',"'
+      replace: '"'
+    when: hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+
+  - name: 部署ETCD---systemctl 管理etcd
+    ansible.builtin.copy:
+      src: package/etcd/etcd.service
+      dest: /usr/lib/systemd/system/etcd.service
+      owner: root
+      group: root
+      mode: '0775'
+    when: hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+
+  - name: 部署ETCD---启动etcd并设置为开机启动
+    ansible.builtin.service:
+      name: etcd
+      state: started
+      enabled: yes
+    when: hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+
+  - name: 部署ETCD---template check_etcd_status.sh
+    ansible.builtin.template:
+      src: package/etcd/check_etcd_status.sh.j2
+      dest: /opt/etcd/bin/check_etcd_status.sh
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+  - name: 部署ETCD---修复template check_etcd_status.sh
+    ansible.builtin.replace:
+      path: /opt/etcd/bin/check_etcd_status.sh
+      regexp: ',"'
+      replace: '"'
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+  - name: 部署ETCD---执行查看ETCD集群状态脚本
+    ansible.builtin.shell: source /opt/etcd/bin/check_etcd_status.sh
+    register: result
+    when: 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined 
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+
+  - name: 部署ETCD---验证etcd集群状态
+    ansible.builtin.debug:
+      var: result.stdout_lines
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.etcd_name is defined
+      - hostvars[ansible_default_ipv4.address].vars.etcd_tls is defined
+    failed_when:
+      - result.rc != 0
+
+- name: 安装docker
+  hosts: all
+  remote_user: root
+
+  tasks:
+  - name: 安装docker---验证docker是否已经安装
+    ansible.builtin.shell: |
+      docker --version
+    register: result
+    ignore_errors: yes
+
+  - name: 安装docker
+    block:
+      - name: 安装docker---安装docker
+        ansible.builtin.copy:
+          src: "{{ item }}"
+          dest: /usr/bin/
+          owner: root
+          group: root
+          mode: '0775'
+        with_fileglob:
+          - package/docker/*
+
+      - name: 安装docker---分发docker systemd文件
+        ansible.builtin.copy:
+          src: package/docker.service
+          dest: /etc/systemd/system/
+          owner: root
+          group: root
+          mode: '0775'
+
+      - name: 安装docker---判断/etcd/docker是否存在
+        ansible.builtin.shell: ls /etc/docker/
+        register: etc_result
+        ignore_errors: yes
+
+      - name: 安装docker---创建/etc/doocker目录
+        ansible.builtin.file:
+          path: /etc/docker
+          state: directory
+        when: etc_result.rc != 0
+
+      - name: 安装docker---分发docker daemon.json文件
+        ansible.builtin.template:
+          src: package/docker_daemon.json.j2
+          dest: /etc/docker/daemon.json
+
+      - name: 安装docker---启动docker
+        ansible.builtin.service:
+          name: docker
+          state: started
+          enabled: yes
+    when:
+      - result.rc != 0
+
+  - name: 分发k8s镜像文件
+    ansible.builtin.copy:
+      src: package/image/{{ item }}
+      dest: /tmp/{{ item }}
+      mode: '0644'
+    loop:
+      - kubernetesui_dashboard.tar.gz
+      - kubernetesui_metrics-scraper.tar.gz
+      - calico_cni.tar.gz
+      - calico_kube-controllers.tar.gz
+      - calico_node.tar.gz
+      - calico_pod2daemon-flexvol.tar.gz
+      - coredns.tar.gz
+      - metrics-server.tar.gz
+      - pause-amd64.tar.gz
+
+  - name: 导入image
+    ansible.builtin.script:
+      chdir: /tmp/
+      cmd: package/image/load_image.sh
+    ignore_errors: yes
+
+- name: 部署kube-apiserver
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署kube-apiserver---分发k8s证书
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /root/TLS/k8s/
+      owner: root
+      group: root
+      mode: '0644'
+    loop:
+      - package/k8s/ca-config.json
+      - package/k8s/ca-csr.json
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-apiserver---template server-csr.json
+    ansible.builtin.template:
+      src: package/k8s/server-csr.json.j2
+      dest: /root/TLS/k8s/server-csr.json
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-apiserver---生成证书
+    ansible.builtin.shell: |
+      cd /root/TLS/k8s;
+      cfssl gencert -initca ca-csr.json | cfssljson -bare ca -;
+      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes server-csr.json | cfssljson -bare server
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-apiserver---template kube-apiserver.conf
+    ansible.builtin.template:
+      src: package/k8s/kube-apiserver.conf.j2
+      dest: /opt/kubernetes/cfg/kube-apiserver.conf
+
+  - name: 部署kube-apiserver---修复template kube-apiserver.conf
+    ansible.builtin.replace:
+      path: /opt/kubernetes/cfg/kube-apiserver.conf
+      regexp: ',  --bind-address'
+      replace: ' --bind-address'
+
+  - name: 部署kube-apiserver---分发证书到证书存放目录
+    ansible.builtin.copy:
+      remote_src: true
+      src: /root/TLS/k8s/{{ item }}
+      dest: /opt/kubernetes/ssl/
+    loop:
+      - ca-key.pem
+      - ca.pem
+      - server-key.pem
+      - server.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name:  部署kube-apiserver---分发token文件
+    ansible.builtin.template:
+      src:  package/k8s/token.csv.j2
+      dest: /opt/kubernetes/cfg/token.csv
+
+  - name:  部署kube-apiserver---sytemctl kube-apiserver
+    ansible.builtin.copy:
+      src: package/k8s/kube-apiserver.service
+      dest: /usr/lib/systemd/system/
+      owner: root
+      group: root
+      mode: '0755'
+
+  - name: 部署kube-apiserver---启动kube-apiserver并设置为开机启动
+    ansible.builtin.service:
+      name: kube-apiserver
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+- name: 部署kube-controller-manager
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署kube-controller-manager---template kube-controller-manager.conf
+    ansible.builtin.template:
+      src:  package/k8s/kube-controller-manager.conf.j2
+      dest: /opt/kubernetes/cfg/kube-controller-manager.conf
+
+  - name: 部署kube-controller-manager---copy kube-controller-manager-csr.json
+    ansible.builtin.copy:
+      src: package/k8s/kube-controller-manager-csr.json
+      dest: /root/TLS/k8s/
+      owner: root
+      group: root
+      mode: '0644'
+
+  - name: 部署kube-controller-manager---创建证书请求文件
+    ansible.builtin.shell: |
+      cd /root/TLS/k8s;
+      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-controller-manager-csr.json | cfssljson -bare kube-controller-manager
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+      kubectl config set-credentials kube-controller-manager --client-certificate=/root/TLS/k8s/kube-controller-manager.pem --client-key=/root/TLS/k8s/kube-controller-manager-key.pem --embed-certs=true --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+      kubectl config set-context default --cluster=kubernetes --user=kube-controller-manager --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+      kubectl config use-context default --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-controller-manager---systemd管理controller-manager
+    ansible.builtin.copy:
+      src: package/k8s/kube-controller-manager.service
+      dest: /usr/lib/systemd/system/
+      owner: root
+      group: root
+      mode: '0755'
+
+  - name: 部署kube-controller-manager---启动并设置开机启动
+    ansible.builtin.service:
+      name: kube-controller-manager
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+- name: 部署kube-scheduler
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署kube-scheduler---copy kube-scheduler.conf
+    ansible.builtin.copy:
+      src: package/k8s/kube-scheduler.conf
+      dest: /opt/kubernetes/cfg/
+      owner: root
+      group: root
+      mode: '0644'
+
+  - name: 部署kube-scheduler---copy kube-scheduler-csr.json
+    ansible.builtin.copy:
+      src: package/k8s/kube-scheduler-csr.json
+      dest: /root/TLS/k8s/kube-scheduler-csr.json
+      owner: root
+      group: root
+      mode: '0644'
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-scheduler---生成证书
+    ansible.builtin.shell: |
+      cd /root/TLS/k8s;
+      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-scheduler-csr.json | cfssljson -bare kube-scheduler
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+      kubectl config set-credentials kube-scheduler --client-certificate=/root/TLS/k8s/kube-scheduler.pem --client-key=/root/TLS/k8s/kube-scheduler-key.pem --embed-certs=true --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+      kubectl config set-context default --cluster=kubernetes --user=kube-scheduler --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+      kubectl config use-context default --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-scheduler---systemd管理scheduler
+    ansible.builtin.copy:
+      src: package/k8s/kube-scheduler.service
+      dest: /usr/lib/systemd/system/kube-scheduler.service
+      owner: root
+      group: root
+      mode: '0775'
+
+  - name: 部署kube-scheduler---启动kube-scheduler并设置为开机启动
+    ansible.builtin.service:
+      name: kube-scheduler
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-scheduler---copy admin-csr.json
+    ansible.builtin.copy:
+      src: package/k8s/admin-csr.json
+      dest: /root/TLS/k8s/
+      owner: root
+      group: root
+      mode: '0644'
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-scheduler---生成证书
+    ansible.builtin.shell: |
+      cd /root/TLS/k8s;
+      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes admin-csr.json | cfssljson -bare admin
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-scheduler---创建.kube目录
+    ansible.builtin.file:
+      path:  /root/.kube
+      state: directory
+      owner: root
+      group: root
+
+  - name: 部署kube-scheduler---生成配置文件
+    ansible.builtin.shell: |
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/root/.kube/config
+      kubectl config set-credentials cluster-admin --client-certificate=/root/TLS/k8s/admin.pem --client-key=/root/TLS/k8s/admin-key.pem --embed-certs=true --kubeconfig=/root/.kube/config
+      kubectl config set-context default --cluster=kubernetes --user=cluster-admin --kubeconfig=/root/.kube/config
+      kubectl config use-context default --kubeconfig=/root/.kube/config
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 查看集群状态
+    ansible.builtin.shell: kubectl get cs
+    register: result
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 读取输出
+    ansible.builtin.debug:
+      var: result.stdout_lines
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+
+- name: 部署kubelet
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署kubelet---授权kubelet-bootstrap用户允许请求证书
+    ansible.builtin.shell: |
+      kubectl create clusterrolebinding kubelet-bootstrap --clusterrole=system:node-bootstrapper --user=kubelet-bootstrap
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kubelet---copy kubelet kube-proxy
+    ansible.builtin.copy:
+      src: package/kubernetes/server/bin/{{ item }}
+      dest: /opt/kubernetes/bin/
+      owner: root
+      group: root
+      mode: '0775'
+    loop:
+      - kubelet
+      - kube-proxy
+
+  - name: 部署kubelet---template kubelet配置文件
+    ansible.builtin.template:
+      src: package/k8s/kubelet.conf.j2
+      dest: /opt/kubernetes/cfg/kubelet.conf
+      owner: root
+      group: root
+      mode: '0644'
+
+  - name: 部署kubelet---template kubelet-config.yml
+    ansible.builtin.template:
+      src: package/k8s/kubelet-config.yml.j2
+      dest: /opt/kubernetes/cfg/kubelet-config.yml
+
+  - name: 生成 kubelet bootstrap kubeconfig 配置文件
+    ansible.builtin.shell:  |
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/opt/kubernetes/cfg/bootstrap.kubeconfig;
+      kubectl config set-credentials "kubelet-bootstrap" --token={{ hostvars[ansible_default_ipv4.address].kubelet_bootstrap_token }} --kubeconfig=/opt/kubernetes/cfg/bootstrap.kubeconfig;
+      kubectl config set-context default --cluster=kubernetes --user="kubelet-bootstrap" --kubeconfig=/opt/kubernetes/cfg/bootstrap.kubeconfig;
+      kubectl config use-context default --kubeconfig=/opt/kubernetes/cfg/bootstrap.kubeconfig;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kubelet---systemd管理kubelet
+    ansible.builtin.copy:
+      src: package/k8s/kubelet.service
+      dest: /usr/lib/systemd/system/kubelet.service
+      owner: root
+      group: root
+      mode: '0755'
+
+  - name: 部署kubelet---启动kubelet并设置开机启动
+    ansible.builtin.service:
+      name: kubelet
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 批准申请
+    ansible.builtin.shell: sleep 10 &&  for req in $(kubectl get csr|awk '{print$1}'|grep -v NAME); do kubectl certificate approve $req ;done
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+- name: 部署kube-proxy
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署kube-proxy---copy kube-proxy.conf
+    ansible.builtin.copy:
+      src: package/k8s/kube-proxy.conf
+      dest: /opt/kubernetes/cfg/kube-proxy.conf
+      owner: root
+      group: root
+      mode: '0644'
+
+  - name: 部署kube-proxy---template kube-proxy-config.yml
+    ansible.builtin.template:
+      src: package/k8s/kube-proxy-config.yml.j2
+      dest: /opt/kubernetes/cfg/kube-proxy-config.yml
+
+  - name: 部署kube-proxy---copy kube-proxy-csr.json
+    ansible.builtin.copy:
+      src: package/k8s/kube-proxy-csr.json
+      dest: /root/TLS/k8s/kube-proxy-csr.json
+      owner: root
+      group: root
+      mode: '0644'
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-proxy---生成证书
+    ansible.builtin.shell: |
+      cd /root/TLS/k8s/;
+      cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=ca-config.json -profile=kubernetes kube-proxy-csr.json | cfssljson -bare kube-proxy;
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/opt/kubernetes/cfg/kube-proxy.kubeconfig;
+      kubectl config set-credentials kube-proxy --client-certificate=/root/TLS/k8s/kube-proxy.pem --client-key=/root/TLS/k8s/kube-proxy-key.pem --embed-certs=true --kubeconfig=/opt/kubernetes/cfg/kube-proxy.kubeconfig;
+      kubectl config set-context default --cluster=kubernetes --user=kube-proxy --kubeconfig=/opt/kubernetes/cfg/kube-proxy.kubeconfig;
+      kubectl config use-context default --kubeconfig=/opt/kubernetes/cfg/kube-proxy.kubeconfig;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署kube-proxy---systemd管理kube-proxy
+    ansible.builtin.copy:
+      src: package/k8s/kube-proxy.service
+      dest: /usr/lib/systemd/system/kube-proxy.service
+      owner: root
+      group: root
+      mode: '0755'
+
+  - name: 部署kube-proxy---启动kube-proxy并设置开机启动
+    ansible.builtin.service:
+      name: kube-proxy
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+- name: 部署calico网络
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署calico网络---template calico.yaml
+    ansible.builtin.template:
+      src: package/k8s/calico.yaml.j2
+      dest: /tmp/calico.yaml
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署calico网络---apply calico网络
+    ansible.builtin.shell: kubectl apply -f /tmp/calico.yaml
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署calico网络---copy apiserver-to-kubelet-rbac.yaml
+    ansible.builtin.copy:
+      src: package/k8s/apiserver-to-kubelet-rbac.yaml
+      dest: /tmp/apiserver-to-kubelet-rbac.yaml
+      owner: root
+      group: root
+      mode: '0644'
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署calico网络---授权apiserver访问kubelet
+    ansible.builtin.shell: kubectl apply -f /tmp/apiserver-to-kubelet-rbac.yaml
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+- name: 获取k8s证书&&配置文件
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 获取k8s证书&&配置文件---获取k8s证书
+    ansible.builtin.fetch:
+      src: /opt/kubernetes/ssl/{{ item }}
+      dest: /tmp/kubernetes_ssl/
+      flat: yes
+    loop:
+      - ca-key.pem
+      - ca.pem
+      - server-key.pem
+      - server.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+    ignore_errors: yes
+
+
+  - name:  获取k8s证书&&配置文件---获取配置文件
+    ansible.builtin.fetch:
+      src: /opt/kubernetes/cfg/{{ item }}
+      dest: /tmp/kubernetes_cfg/
+      flat: yes
+    loop:
+      - bootstrap.kubeconfig
+      - kube-apiserver.conf
+      - kube-controller-manager.conf
+      - kube-controller-manager.kubeconfig
+      - kubelet.conf
+      - kubelet-config.yml
+      - kube-proxy.conf
+      - kube-proxy-config.yml
+      - kube-proxy.kubeconfig
+      - kube-scheduler.conf
+      - kube-scheduler.kubeconfig
+      - token.csv
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+    ignore_errors: yes
+
+- name: 部署node节点
+  hosts: node
+  remote_user: root
+  tasks:
+  - name: 部署node节点---copy kubernetes ssl获取信息到node节点
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /opt/kubernetes/ssl/
+      owner: root
+      group: root
+    with_fileglob:
+      - /tmp/kubernetes_ssl/*
+
+  - name: 部署node节点---copy kubernetes cfg获取信息到node节点
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /opt/kubernetes/cfg/
+      owner: root
+      group: root
+    with_fileglob:
+      - /tmp/kubernetes_cfg/*
+
+  - name: 部署node节点---copy kubelet.config和kube-proxy-config
+    ansible.builtin.template:
+      src: "{{ item }}"
+      dest: /opt/kubernetes/cfg/{{ item.split('.j2')[0].split('/')[-1] }}
+    loop:
+      - package/k8s/kube-proxy-config.yml.j2
+      - package/k8s/kubelet.conf.j2
+
+  - name: 部署node节点---copy kubelet.service,kube-proxy.service
+    ansible.builtin.copy:
+      src: package/k8s/{{ item }}
+      dest: /usr/lib/systemd/system/
+      owner: root
+      group: root
+      mode: '0755'
+    loop:
+      - kubelet.service
+      - kube-proxy.service
+
+  - name: 部署node节点---分发证书
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+      - /opt/kubernetes/ssl/kubelet-client-current.pem
+      - /opt/kubernetes/ssl/kubelet.crt
+      - /opt/kubernetes/ssl/kubelet.ke
+      - /opt/kubernetes/cfg/kubelet.kubeconfig
+
+  - name: 部署node节点---copykubelet kube-proxy
+    ansible.builtin.copy:
+      src: package/kubernetes/server/bin/{{ item }}
+      dest: /opt/kubernetes/bin/
+      owner: root
+      group: root
+      mode: '0775'
+    loop:
+      - kubelet
+      - kube-proxy
+
+  - name: 启动kube-proxy并设置开机启动
+    ansible.builtin.service:
+      name: kube-proxy
+      state: started
+      enabled: yes
+
+  - name: 部署node节点---启动kubelet.service并设置开机启动
+    ansible.builtin.service:
+      name: kubelet.service
+      state: started
+      enabled: yes
+
+
+- name: 部署master多节点
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署master多节点---copy key pem
+    ansible.builtin.copy:
+      src: package/etcd/{{ item }}
+      dest: /opt/etcd/ssl/
+    loop:
+      - ca-key.pem
+      - ca.pem
+      - server-key.pem
+      - server.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---部署kube-apiserver获取证书文件
+    ansible.builtin.fetch:
+      flat: yes
+      src: /opt/kubernetes/ssl/{{ item }}
+      dest: /tmp/kube-apiserver/{{ item }}
+    loop:
+      - server.pem
+      - server-key.pem
+      - ca-key.pem
+      - ca.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署master多节点---部署kube-apiserver获取token.csv文件
+    ansible.builtin.fetch:
+      flat: yes
+      src: /opt/kubernetes/cfg/token.csv
+      dest: /tmp/kube-apiserver/token.csv
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署master多节点---部署kube-apiserver分发证书
+    ansible.builtin.copy:
+      src: /tmp/kube-apiserver/{{ item }}
+      dest: /opt/kubernetes/ssl/{{ item }}
+    loop:
+      - server.pem
+      - server-key.pem
+      - ca-key.pem
+      - ca.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---部署kube-apiserver分发token.csv文件
+    ansible.builtin.copy:
+      src: /tmp/kube-apiserver/token.csv
+      dest: /opt/kubernetes/cfg/token.csv
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---启动kube-apiserver并设置开机启动
+    ansible.builtin.service:
+      name:  kube-apiserver
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+
+  - name: 部署master多节点---部署 kube-controller-manager获取证书
+    ansible.builtin.fetch:
+      src: /root/TLS/k8s/{{ item }}
+      dest: /tmp/kube-controller-manager/{{ item }}
+      flat: yes
+    loop:
+      - kube-controller-manager-key.pem
+      - kube-controller-manager.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署master多节点---部署kube-controller-manager分发证书
+    ansible.builtin.copy:
+      src: /tmp/kube-controller-manager/{{ item }}
+      dest: /root/TLS/k8s/{{ item }}
+    loop:
+      - kube-controller-manager-key.pem
+      - kube-controller-manager.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---生成文件
+    ansible.builtin.shell: |
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+      kubectl config set-credentials kube-controller-manager --client-certificate=/root/TLS/k8s/kube-controller-manager.pem --client-key=/root/TLS/k8s/kube-controller-manager-key.pem --embed-certs=true --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+      kubectl config set-context default --cluster=kubernetes --user=kube-controller-manager --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+      kubectl config use-context default --kubeconfig=/opt/kubernetes/cfg/kube-controller-manager.kubeconfig;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---启动kube-controller-manager并设置开机启动
+    ansible.builtin.service:
+      name: kube-controller-manager
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---部署kube-scheduler获取证书
+    ansible.builtin.fetch:
+      src: /root/TLS/k8s/{{ item }}
+      dest: /tmp/kube-scheduler/{{ item }}
+      flat: yes
+    loop:
+      - kube-scheduler-key.pem
+      - kube-scheduler.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 部署master多节点---部署kube-scheduler分发证书
+    ansible.builtin.copy:
+      src: /tmp/kube-scheduler/{{ item }}
+      dest: /root/TLS/k8s/{{ item }}
+    loop:
+      - kube-scheduler-key.pem
+      - kube-scheduler.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+
+  - name: 部署master多节点---生成配置文件
+    ansible.builtin.shell: |
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+      kubectl config set-credentials kube-scheduler --client-certificate=/root/TLS/k8s/kube-scheduler.pem --client-key=/root/TLS/k8s/kube-scheduler-key.pem --embed-certs=true --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+      kubectl config set-context default --cluster=kubernetes --user=kube-scheduler --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+      kubectl config use-context default --kubeconfig=/opt/kubernetes/cfg/kube-scheduler.kubeconfig;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署master多节点---启动kube-scheduler并设置开机启动
+    ansible.builtin.service:
+      name: kube-scheduler
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: .kube操作---获取证书
+    ansible.builtin.fetch:
+      flat: yes
+      src: /root/TLS/k8s/{{ item }}
+      dest: /tmp/.kube/{{ item }}
+    loop:
+      - admin-key.pem
+      - admin.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: .kube操作---分发证书
+    ansible.builtin.copy:
+      src: /tmp/.kube/{{ item }}
+      dest: /root/TLS/k8s/{{ item }}
+    loop:
+      - admin-key.pem
+      - admin.pem
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 生成配置文件
+    ansible.builtin.shell: |
+      kubectl config set-cluster kubernetes --certificate-authority=/opt/kubernetes/ssl/ca.pem --embed-certs=true --server=https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }} --kubeconfig=/root/.kube/config;
+      kubectl config set-credentials cluster-admin --client-certificate=/root/TLS/k8s/admin.pem --client-key=/root/TLS/k8s/admin-key.pem --embed-certs=true --kubeconfig=/root/.kube/config;
+      kubectl config set-context default --cluster=kubernetes --user=cluster-admin --kubeconfig=/root/.kube/config;
+      kubectl config use-context default --kubeconfig=/root/.kube/config;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---拷贝kubernetes ssl获取信息到node节点
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /opt/kubernetes/ssl/
+      owner: root
+      group: root
+    with_fileglob:
+      - /tmp/kubernetes_ssl/*
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---拷贝kubernetes cfg获取信息到node节点
+    ansible.builtin.copy:
+      src: "{{ item }}"
+      dest: /opt/kubernetes/cfg/
+      owner: root
+      group: root
+    with_fileglob:
+      - /tmp/kubernetes_cfg/*
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---拷贝kubelet.config和kube-proxy-config
+    ansible.builtin.template:
+      src: "{{ item }}"
+      dest: /opt/kubernetes/cfg/{{ item.split('.j2')[0].split('/')[-1] }}
+    loop:
+      - package/k8s/kube-proxy-config.yml.j2
+      - package/k8s/kubelet.conf.j2
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---拷贝kubelet.service,kube-proxy.service
+    ansible.builtin.copy:
+      src: package/k8s/{{ item }}
+      dest: /usr/lib/systemd/system/
+      owner: root
+      group: root
+      mode: '0755'
+    loop:
+      - kubelet.service
+      - kube-proxy.service
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---重新生成kubelet.kubeconfig
+    ansible.builtin.file:
+      path: "{{ item }}"
+      state: absent
+    loop:
+      - /opt/kubernetes/ssl/kubelet-client-current.pem
+      - /opt/kubernetes/ssl/kubelet.crt
+      - /opt/kubernetes/ssl/kubelet.ke
+      - /opt/kubernetes/cfg/kubelet.kubeconfig
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---拷贝kubelet kube-proxy
+    ansible.builtin.copy:
+      src: package/kubernetes/server/bin/{{ item }}
+      dest: /opt/kubernetes/bin/
+      owner: root
+      group: root
+      mode: '0775'
+    loop:
+      - kubelet
+      - kube-proxy
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---启动kube-proxy并设置开机启动
+    ansible.builtin.service:
+      name: kube-proxy
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+  - name: 部署kubelet&kube-proxy---启动kubelet.service并设置开机启动
+    ansible.builtin.service:
+      name: kubelet.service
+      state: started
+      enabled: yes
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is undefined
+
+- name: 批准请求
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 批准申请
+    ansible.builtin.shell: sleep 10 && for req in $(kubectl get csr|awk '{print$1}'|grep -v NAME); do kubectl certificate approve $req ;done
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 查看节点
+    ansible.builtin.shell: sleep 10 && kubectl get node
+    register: node_info
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 输出信息
+    ansible.builtin.debug:
+      var: node_info.stdout_lines
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+- name: 部署dashboard&&coredns && metrics
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 创建kubernetes-dashboard.yaml && coredns.yaml && metrics-server.yaml
+    ansible.builtin.copy:
+      src: package/k8s/{{ item }}
+      dest: /tmp/
+      owner: root
+      group: root
+      mode: '0644'
+    loop:
+      - kubernetes-dashboard.yaml
+      - coredns.yaml
+      - metrics-server.yaml
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+
+  - name: 部署dashboard && coredns.yaml
+    ansible.builtin.shell: |
+      kubectl apply -f /tmp/kubernetes-dashboard.yaml;
+      kubectl apply -f /tmp/coredns.yaml ;
+      kubectl apply -f /tmp/metrics-server.yaml;
+      kubectl get pods,svc -n kubernetes-dashboard;
+      kubectl create serviceaccount dashboard-admin -n kube-system;
+      kubectl create clusterrolebinding dashboard-admin --clusterrole=cluster-admin --serviceaccount=kube-system:dashboard-admin;
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 生成dashboard的token
+    ansible.builtin.shell: kubectl describe secrets -n kube-system $(kubectl -n kube-system get secret | awk '/dashboard-admin/{print $1}');
+    register: dashboard_token
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+  - name: 输出dashboard的token
+    ansible.builtin.debug:
+      var: dashboard_token.stdout
+    when:
+      - hostvars[ansible_default_ipv4.address].vars.k8s_tls is defined
+
+
+- name: 部署master高可用
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 部署高可用
+    block:
+      - name: 部署master高可用---安装nginx
+        ansible.builtin.yum:
+          name: "{{ item }}"
+          state: installed
+        loop:
+          - epel-release
+          - keepalived
+
+      - name: 部署master高可用---编译安装nginx
+        ansible.builtin.yum:
+          name: "{{ item }}"
+          state: installed
+        loop:
+          - make
+          - zlib
+          - zlib-devel
+          - gcc-c++
+          - libtool
+          - openssl
+          - openssl-devel
+          - pcre
+          - pcre-devel
+
+      - name: 部署master高可用---copy nginx
+        ansible.builtin.copy:
+          src: package/nginx-1.20.1.tar.gz
+          dest: /tmp/
+
+      - name: 部署master高可用---创建nginx用户
+        ansible.builtin.shell: |
+          useradd nginx -M -s /sbin/nologin;
+          cd /tmp/; tar xf nginx-1.20.1.tar.gz;
+          cd nginx-1.20.1
+          chmod +x ./configure 
+          ./configure  --prefix=/etc/nginx/ --sbin-path=/usr/local/bin/ --user=nginx --group=nginx   --with-http_ssl_module  --with-http_stub_status_module  --with-stream --conf-path=/etc/nginx/nginx.conf  --error-log-path=/var/log/nginx/error.log --http-log-path=/var/log/nginx/access.log --pid-path=/var/run/nginx.pid
+          make && make install
+
+      - name: 部署master高可用---copy systemd管理nginx
+        ansible.builtin.copy:
+          src: package/nginx.service
+          dest: /etc/systemd/system/nginx.service
+          mode: '0755'
+
+      - name: 部署master高可用---拷贝nginx配置文件
+        ansible.builtin.template:
+          src: package/nginx.conf.j2
+          dest: /etc/nginx/nginx.conf
+
+      - name: 部署master高可用---keepalived配置文件
+        ansible.builtin.template:
+          src: package/keepalived.conf.j2
+          dest: /etc/keepalived/keepalived.conf
+
+      - name: 部署master高可用---template check_nginx.sh
+        ansible.builtin.template:
+          src: package/check_nginx.sh.j2
+          dest: /etc/keepalived/check_nginx.sh
+
+      - name: 部署master高可用---为脚本授权
+        ansible.builtin.file:
+          path: /etc/keepalived/check_nginx.sh
+          mode: '0755'
+
+      - name: 部署master高可用---启动nginx&&keepalived并设置为开机启动
+        ansible.builtin.service:
+          name: "{{ item }}"
+          state: started
+          enabled: yes
+        loop:
+          - nginx
+          - keepalived
+
+      - name: 部署master高可用---查看keepalived工作状态
+        ansible.builtin.shell: ip addr
+        register: ip_addr_res
+
+      - name: 部署master高可用---输出状态信息
+        ansible.builtin.debug:
+          var: ip_addr_res.stdout_lines
+    when: groups.master|length|int >= 2
+
+- name: node节点替换高可用IP地址
+  hosts: node
+  remote_user: root
+
+  tasks:
+  - name: 检查master中有几个IP地址
+    ansible.builtin.debug:
+      var: groups.master|length|int
+    register: master_num
+
+  - name: 替换为vip地址
+    ansible.builtin.shell: "sed -i 's#{{ groups.master.0 }}:{{ hostvars[ansible_default_ipv4.address].kube_apiserver_port }}#{{ hostvars[ansible_default_ipv4.address].virtual_ipaddress.split('/')[0] }}:{{ hostvars[ansible_default_ipv4.address].virtual_port }}#' /opt/kubernetes/cfg/*  warn=false"
+    when:
+      - hostvars[ansible_default_ipv4.address].virtual_ipaddress is defined
+
+  - name: 重新启动kubelet&& kube-proxy
+    ansible.builtin.service:
+      name: "{{ item }}"
+      state: restarted
+      enabled: yes
+    loop:
+      - kubelet
+      - kube-proxy
+
+- name: 查看node节点状态
+  hosts: master
+  remote_user: root
+
+  tasks:
+  - name: 执行命令
+    ansible.builtin.shell: kubectl get node
+    register: node_status
+
+  - name: 返回节点状态
+    ansible.builtin.debug:
+      var: node_status.stdout_lines

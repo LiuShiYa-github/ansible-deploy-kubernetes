@@ -1,0 +1,16 @@
+{
+    "CN": "etcd",
+    "hosts": [{% for ip in groups.all|sort %}{% if hostvars[ip].vars.etcd_name is defined %}"{{ ip }}",{% endif %}{% endfor %}],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "CN",
+            "L": "BeiJing",
+            "ST": "BeiJing"
+        }
+    ]
+}
+

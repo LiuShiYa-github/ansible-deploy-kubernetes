@@ -1,0 +1,44 @@
+all:
+  vars:
+    registry_mirrors: https://b9pmyelo.mirror.aliyuncs.com
+    service_cluster_ip_range: 10.0.0.0/24
+    kubelet_bootstrap_token: c47ffb939f5ca36231d9e3121a252940
+    cluster_cidr: 10.244.0.0/16
+    kube_apiserver_port: 6443
+    clusterDNS: 10.0.10.2
+    virtual_port: 16443
+    virtual_ipaddress: 10.0.0.100/24
+  children:
+    master:
+      hosts:
+        10.0.0.16:
+          vars:
+            host_name: k8s_master01
+            etcd_name: etcd-1
+            etcd_peer_port: 2380
+            etcd_client_port: 2379
+            etcd_tls: true
+            k8s_tls: true
+            interface: eth0
+            priority: 100
+            vrrp_instance_state: MASTER
+        10.0.0.19:
+          vars:
+            host_name: k8s_master02
+            interface: eth0
+            priority: 90
+            vrrp_instance_state: BACKUP
+    node:
+      hosts:
+        10.0.0.17:
+          vars:
+            host_name: k8s_node01
+            etcd_name: etcd-2
+            etcd_peer_port: 2380
+            etcd_client_port: 2379
+        10.0.0.18:
+          vars:
+            host_name: k8s_node02
+            etcd_name: etcd-3
+            etcd_peer_port: 2380
+            etcd_client_port: 2379

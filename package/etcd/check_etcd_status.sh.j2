@@ -1,0 +1,2 @@
+#!/bin/bash
+ETCDCTL_API=3 /opt/etcd/bin/etcdctl --cacert=/opt/etcd/ssl/ca.pem --cert=/opt/etcd/ssl/server.pem --key=/opt/etcd/ssl/server-key.pem --endpoints="{% for ip in groups.all|sort %}{% if hostvars[ip].vars.etcd_name is defined %}https://{{ ip }}:{{ hostvars[ip].vars.etcd_client_port }}{% endif %}{% if not loop.last%},{% endif %}{% endfor %}" endpoint health --write-out=table

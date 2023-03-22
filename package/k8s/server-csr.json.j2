@@ -1,0 +1,31 @@
+{
+    "CN": "kubernetes",
+    "hosts": [
+      "127.0.0.1",
+      "10.0.0.1",
+      {% for ip in groups.all|sort %}
+      "{{ ip }}",
+      {% endfor %}
+      {% if hostvars[ansible_default_ipv4.address].virtual_ipaddress is defined %}
+      "{{ hostvars[ansible_default_ipv4.address].virtual_ipaddress.split('/')[0] }}",
+      {% endif %}
+      "kubernetes",
+      "kubernetes.default",
+      "kubernetes.default.svc",
+      "kubernetes.default.svc.cluster",
+      "kubernetes.default.svc.cluster.local"
+    ],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+        {
+            "C": "CN",
+            "L": "BeiJing",
+            "ST": "BeiJing",
+            "O": "k8s",
+            "OU": "System"
+        }
+    ]
+}

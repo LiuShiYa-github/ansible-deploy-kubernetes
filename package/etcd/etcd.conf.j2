@@ -1,0 +1,12 @@
+#[Member]
+ETCD_NAME="{{ hostvars[ansible_default_ipv4.address].vars.etcd_name }}"
+ETCD_DATA_DIR="/var/lib/etcd/default.etcd"
+ETCD_LISTEN_PEER_URLS="https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].vars.etcd_peer_port }}"
+ETCD_LISTEN_CLIENT_URLS="https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].vars.etcd_client_port }}"
+
+#[Clustering]
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].vars.etcd_peer_port }}"
+ETCD_ADVERTISE_CLIENT_URLS="https://{{ ansible_default_ipv4.address }}:{{ hostvars[ansible_default_ipv4.address].vars.etcd_client_port }}"
+ETCD_INITIAL_CLUSTER="{% for ip in groups.all|sort %}{% if hostvars[ip].vars.etcd_name is defined %}{{ hostvars[ip].vars.etcd_name }}=https://{{ ip }}:{{ hostvars[ip].vars.etcd_peer_port }}{% endif %}{% if not loop.last%},{% endif %}{% endfor %}"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+ETCD_INITIAL_CLUSTER_STATE="new"
