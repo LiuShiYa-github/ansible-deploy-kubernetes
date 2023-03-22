@@ -46,6 +46,11 @@ etcd、nginx、docker版本更换同kubernetes一样
 
 为方便大家使用，将需要可能根据具体环境调整的参数都放到了hosts.yaml中，该文件将作为“input”。
 
+使用时需要将已下文件进行补充，都是部署kubernetes中用到的二进制文件包
+![img.png](img/img_4.png)
+
+如果需要更换docker\kubernetes\etcd的版本，请将下载后的二进制文件解压后放到package中即可
+
 ```yaml
 all:
   vars: # 全局变量
